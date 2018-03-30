@@ -8,20 +8,56 @@ using OnlineStats, DataStructures
 export @timetrack, statetrack, logmsg
 export pids, events, entries, reset, show
 export start_sender, stop_sender, start_listener, stop_listener
+export Collector, StatsCollector, StateCollector, WindowCollector, TimeStatsCollector, LogsCollector, AnyStateCollector
 
 const enabled = Ref(true)
 const listenon = Ref(true)
 const daemon = Task[]
 
+const MonKey = Tuple{Int,Symbol}
+abstract type Collector end
+const EventChannel = Channel{Any}(1024)
+const NoOpEvent = (:noop, 0, :noop, 0)
+const RegisteredCollectors = Dict{Symbol, Collector}()
+register(spec::Tuple) = register(spec[1], spec[2])
+register(name::Symbol, collector) = RegisteredCollectors[name] = collector
+register(collector::Collector) = RegisteredCollectors[collector.cmd] = collector
+unregister(collector::Collector) = unregister(collector.cmd)
+unregister(cmd::Symbol) = try delete!(RegisteredCollectors, cmd) end
+
+#----------------------------------------------------------
+# Generic collectors
+#----------------------------------------------------------
+struct StatsCollector{T<:Series} <: Collector
+    cmd::Symbol
+    data::Dict{MonKey,T}
+    startvalfn::Function
+    StatsCollector{T}(cmd, startvalfn) where {T<:Series} = new(cmd, Dict{MonKey,T}(), startvalfn)
+end
+assimilate(collector::StatsCollector{T}, pid::Int, event::Symbol, val) where {T} = (fit!(get!(collector.startvalfn, collector.data, (pid,event)), val); nothing)
+
+struct StateCollector{T} <: Collector
+    cmd::Symbol
+    data::Dict{MonKey,T}
+    StateCollector{T}(cmd) where {T} = new(cmd, Dict{MonKey,T}())
+end
+assimilate(collector::StateCollector{T}, pid::Int, event::Symbol, val) where {T} = (collector.data[(pid,event)] = val; nothing)
+
+struct WindowCollector{T} <: Collector
+    cmd::Symbol
+    data::Dict{MonKey,CircularBuffer{T}}
+    sz::Int
+    WindowCollector{T}(cmd, sz) where {T} = new(cmd, Dict{MonKey,CircularBuffer{T}}(), sz)
+end
+assimilate(collector::WindowCollector{T}, pid::Int, event::Symbol, val) where {T} = (push!(get!(()->CircularBuffer{T}(collector.sz), collector.data, (pid,event)), val); nothing)
+
+#----------------------------------------------------------
+# TimeStat collector
+#----------------------------------------------------------
 const TTimeStat = Series{0,Tuple{Mean,Variance,Extrema{Float64},Sum{Float64}},EqualWeight}
-const TIMES = Dict{Tuple{Int64,Symbol},TTimeStat}()
-const STATES = Dict{Tuple{Int64,Symbol}, String}()
-const LOGS = Dict{Tuple{Int64,Symbol}, CircularBuffer{String}}()
+TimeStatsCollector() = StatsCollector{TTimeStat}(:time, ()->Series(Mean(), Variance(), Extrema(), Sum()))
 
-const EVTCHAN = Channel{Any}(1024)
-const NOOPEVT = (:noop, 0, :noop, 0)
-
-timesend(event::Symbol, timeval::Float64) = put!(EVTCHAN, (:time, myid(), event, timeval))
+timesend(event::Symbol, timeval::Float64) = put!(EventChannel, (:time, myid(), event, timeval))
 macro timetrack(event, expr)
     quote
         t1 = time()
@@ -37,36 +73,21 @@ macro timetrack(expr)
         $(esc(expr))
     end
 end
-statetrack(event::Symbol, val) = RemoteMonitor.enabled[] && put!(EVTCHAN, (:state, myid(), event, string(val)))
-logmsg(thread::Symbol, msgs...) = RemoteMonitor.enabled[] && put!(EVTCHAN, (:log, myid(), thread, join(map(string, msgs))))
 
-entries(coll::T, pid::Int64) where {T} = filter((k,v)->(k[1]==pid), coll)
-entries(coll::T, event::Symbol) where {T} = filter((k,v)->(k[2]==event), coll)
-entries(coll::T, pid::Int64, event::Symbol) where {T} = filter((k,v)->(k==(pid,event)), coll)
-
-pids(coll) = Set([pid for (pid,event) in keys(coll)])
-events(coll) = Set([event for (pid,event) in keys(coll)])
-reset(coll::Dict{Tuple{Int64,Symbol}, T}) where {T<:Union{TTimeStat,String,CircularBuffer{String}}} = (empty!(coll); nothing)
-reset() = (reset.([TIMES, STATES, LOGS]); nothing)
-
-macro get!(h, key0, default)
-    return quote
-        get!(()->$(esc(default)), $(esc(h)), $(esc(key0)))
-    end
-end
-function val_stat(pub)
-    (pub in keys(TIMES)) || (TIMES[pub] = Series(Mean(), Variance(), Extrema(), Sum()))
-    TIMES[pub]
-end
-
-function show(io::IO, ::MIME{Symbol("text/plain")}, entries::Dict{Tuple{Int64,Symbol}, T}) where {T<:Union{TTimeStat,String}}
+function show(io::IO, ::MIME{Symbol("text/plain")}, entries::Dict{MonKey, TTimeStat})
     for (k,v) in entries
         print_with_color(:red, io, "▦ $(k[1]) - $(k[2]): ", bold=true)
         println(io, v)
     end
 end
 
-function show(io::IO, ::MIME{Symbol("text/plain")}, entries::Dict{Tuple{Int64,Symbol}, CircularBuffer{String}})
+#----------------------------------------------------------
+# Log collector
+#----------------------------------------------------------
+LogsCollector(sz=100) = WindowCollector{String}(:log, sz)
+logmsg(thread::Symbol, msgs...) = RemoteMonitor.enabled[] && put!(EventChannel, (:log, myid(), thread, join(map(string, msgs))))
+
+function show(io::IO, ::MIME{Symbol("text/plain")}, entries::Dict{MonKey,CircularBuffer{String}})
     for (k,v) in entries
         print_with_color(:red, io, "▦ $(k[1]) - $(k[2]):\n", bold=true)
         for msg in v
@@ -75,69 +96,54 @@ function show(io::IO, ::MIME{Symbol("text/plain")}, entries::Dict{Tuple{Int64,Sy
     end
 end
 
-set_stat!(pid, event, val) = fit!(get!(()->Series(Mean(), Variance(), Extrema(), Sum()), TIMES, (pid,event)), val)
-set_state!(pid, event, val) = STATES[(pid,event)] = val
-set_log!(pid, event, msg) = push!(get!(()->CircularBuffer{String}(100), LOGS, (pid,event)), msg)
+#----------------------------------------------------------
+# Generic State Collector
+#----------------------------------------------------------
+AnyStateCollector() = StateCollector{Any}(:state)
+statetrack(event::Symbol, val) = RemoteMonitor.enabled[] && put!(EventChannel, (:state, myid(), event, val))
 
+function show(io::IO, ::MIME{Symbol("text/plain")}, entries::Dict{MonKey,Any})
+    for (k,v) in entries
+        print_with_color(:red, io, "▦ $(k[1]) - $(k[2]): ", bold=true)
+        println(io, v)
+    end
+end
+
+#----------------------------------------------------------
+# Data accessors
+#----------------------------------------------------------
+entries(name::Symbol, qualifiers...) = _entries(RegisteredCollectors[name].data, qualifiers...)
+_entries(coll::T, pid::Int64) where {T} = filter((k,v)->(k[1]==pid), coll)
+_entries(coll::T, event::Symbol) where {T} = filter((k,v)->(k[2]==event), coll)
+_entries(coll::T, pid::Int64, event::Symbol) where {T} = filter((k,v)->(k==(pid,event)), coll)
+
+pids(name::Symbol) = _pids(RegisteredCollectors[name].data)
+events(name::Symbol) = _events(RegisteredCollectors[name].data)
+reset(name::Symbol) = _reset(RegisteredCollectors[name].data)
+reset() = (reset.(collect(keys(RegisteredCollectors))); nothing)
+_pids(coll) = Set([pid for (pid,event) in keys(coll)])
+_events(coll) = Set([event for (pid,event) in keys(coll)])
+_reset(coll::Dict{MonKey, T}) where {T} = (empty!(coll); nothing)
+
+
+#----------------------------------------------------------
+# Daemons
+#----------------------------------------------------------
 function process_vals(bytes)
     cmd, pid, event, val = deserialize(IOBuffer(bytes))
     cmd::Symbol
     pid::Int
     event::Symbol
-    if cmd === :time
-        set_stat!(pid, event, val)
-    elseif cmd === :state
-        set_state!(pid, event, val)
-    elseif cmd === :log
-        set_log!(pid, event, val)
-    end
-    nothing
-end
 
-function start_sender()
-    if enabled[] && isempty(daemon)
-        t = @schedule begin
-            sender = UDPSocket()
-            iob = IOBuffer()
-            toaddr = srvraddr::IPv4
-            toport = srvrport::Int
-
-            while enabled[] || isready(EVTCHAN)
-                try
-                    while enabled[] || isready(EVTCHAN)
-                        serialize(iob, take!(EVTCHAN))
-                        send(sender, toaddr, toport, take!(iob))
-                    end
-                catch ex
-                    @show ex
-                end
-            end
-            close(sender)
-        end
-        push!(daemon, t)
-    end
-    nothing
-end
-
-function stop_sender()
-    if enabled[]
-        enabled[] = false
-
-        if !isempty(daemon)
-            t = shift!(daemon)
-
-            if !istaskdone(t)
-                put!(EVTCHAN, NOOPEVT)
-                wait(t)
-                while isready(EVTCHAN)
-                    take!(EVTCHAN)
-                end
-            end
+    for coll in values(RegisteredCollectors)
+        if coll.cmd === cmd
+            assimilate(coll, pid, event, val)
         end
     end
     nothing
 end
 
+start_listener(collectors...) = (register.(collectors); start_listener())
 function start_listener()
     if listenon[] && isempty(daemon)
         t = @schedule begin
@@ -169,10 +175,54 @@ function stop_listener()
 
             if !istaskdone(t)
                 iob = IOBuffer()
-                serialize(iob, NOOPEVT)
+                serialize(iob, NoOpEvent)
                 sender = UDPSocket()
                 send(sender, srvraddr, srvrport, take!(iob))
                 wait(t)
+            end
+        end
+    end
+    nothing
+end
+
+function start_sender()
+    if enabled[] && isempty(daemon)
+        t = @schedule begin
+            sender = UDPSocket()
+            iob = IOBuffer()
+            toaddr = srvraddr::IPv4
+            toport = srvrport::Int
+
+            while enabled[] || isready(EventChannel)
+                try
+                    while enabled[] || isready(EventChannel)
+                        serialize(iob, take!(EventChannel))
+                        send(sender, toaddr, toport, take!(iob))
+                    end
+                catch ex
+                    @show ex
+                end
+            end
+            close(sender)
+        end
+        push!(daemon, t)
+    end
+    nothing
+end
+
+function stop_sender()
+    if enabled[]
+        enabled[] = false
+
+        if !isempty(daemon)
+            t = shift!(daemon)
+
+            if !istaskdone(t)
+                put!(EventChannel, NoOpEvent)
+                wait(t)
+                while isready(EventChannel)
+                    take!(EventChannel)
+                end
             end
         end
     end
