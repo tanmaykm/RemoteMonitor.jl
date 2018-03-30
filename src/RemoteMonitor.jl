@@ -10,7 +10,7 @@ export pids, events, entries, reset, show
 export start_sender, stop_sender, start_listener, stop_listener
 export Collector, StatsCollector, StateCollector, WindowCollector, TimeStatsCollector, LogsCollector, AnyStateCollector
 
-const enabled = Ref(true)
+const enabled = Ref(false)
 const listenon = Ref(true)
 const daemon = Task[]
 
@@ -186,7 +186,8 @@ function stop_listener()
 end
 
 function start_sender()
-    if enabled[] && isempty(daemon)
+    enabled[] = true
+    if isempty(daemon)
         t = @schedule begin
             sender = UDPSocket()
             iob = IOBuffer()
