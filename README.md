@@ -14,3 +14,10 @@ Goals:
 - does not interfere with task context switching
 
 Based on UDP messages and OnlineStats.jl. IO in a separate task. Start monitoring by bringing up a simple notebook.
+
+## Example
+There is a notebook and a parallel Julia example to accompany are [here](notebooks) to serve as a simple example.
+- [Tracker.ipynb](notebooks/Tracker.ipynb)
+- [example_map.jl](notebooks/example_pmap.jl)
+- [mcpi.jl](notebooks/mcpi.jl)
+
