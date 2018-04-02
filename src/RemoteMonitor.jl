@@ -54,7 +54,7 @@ assimilate(collector::WindowCollector{T}, pid::Int, event::Symbol, val) where {T
 #----------------------------------------------------------
 # TimeStat collector
 #----------------------------------------------------------
-const TTimeStat = Series{0,Tuple{Mean,Variance,Extrema{Float64},Sum{Float64}},EqualWeight}
+const TTimeStat = typeof(Series(Mean(), Variance(), Extrema(), Sum()))
 TimeStatsCollector() = StatsCollector{TTimeStat}(:time, ()->Series(Mean(), Variance(), Extrema(), Sum()))
 
 timesend(event::Symbol, timeval::Float64) = put!(EventChannel, (:time, myid(), event, timeval))
