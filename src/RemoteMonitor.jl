@@ -3,12 +3,12 @@ module RemoteMonitor
 
 import Base: show, reset
 
-using OnlineStats, DataStructures
+using OnlineStats, DataStructures, TimerOutputs
 
-export @timetrack, statetrack, logmsg
+export @timetrack, statetrack, logmsg, @remotetimeit
 export pids, events, entries, reset, show
-export start_sender, stop_sender, start_listener, stop_listener
-export Collector, StatsCollector, StateCollector, WindowCollector, TimeStatsCollector, LogsCollector, AnyStateCollector
+export start_sender, stop_sender, start_listener, stop_listener, stop_timeit_sender, start_timeit_sender
+export Collector, StatsCollector, StateCollector, WindowCollector, TimeStatsCollector, LogsCollector, AnyStateCollector, TimeItCollector
 
 const enabled = Ref(false)
 const listenon = Ref(true)
@@ -106,6 +106,50 @@ function show(io::IO, ::MIME{Symbol("text/plain")}, entries::Dict{MonKey,Any})
     for (k,v) in entries
         print_with_color(:red, io, "▦ $(k[1]) - $(k[2]): ", bold=true)
         println(io, v)
+    end
+end
+
+#----------------------------------------------------------
+# TimeIt collector
+#----------------------------------------------------------
+TimeItCollector() = (:timeit, StateCollector{TimerOutput}(:timeit))
+
+const continue_timeit_send = Ref(false)
+const timeit_sender_task = Task[]
+const to = TimerOutput()
+macro remotetimeit(name, expr)
+    quote
+        @timeit(to,string($(esc(name))),$(esc(expr)))
+    end
+end
+
+function stop_timeit_sender()
+    global continue_timeit_send
+    if continue_timeit_send[] && !isempty(timeit_sender_task)
+        t = pop!(timeit_sender_task)
+        continue_timeit_send[] = false
+        wait(t)
+    end
+    nothing
+end
+
+function start_timeit_sender(name=:timeit, cmd=:timeit, interval=2)
+    global continue_timeit_send
+    if isempty(timeit_sender_task)
+        push!(timeit_sender_task, @schedule begin
+            continue_timeit_send[] = true
+            while continue_timeit_send[]
+                sleep(interval)
+                put!(RemoteMonitor.EventChannel, (cmd, myid(), name, to))
+            end
+        end)
+    end
+end
+
+function show(io::IO, ::MIME{Symbol("text/plain")}, entries::Dict{MonKey,TimerOutput})
+    for (k,v) in entries
+        print_with_color(:red, io, "▦ $(k[1]) - $(k[2]):\n", bold=true)
+        println(v)
     end
 end
 
